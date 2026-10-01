@@ -317,34 +317,77 @@ func buildInferencePoolHTTPFilter(pool *gwaiev1.InferencePool) (*httpconnectionm
 	}, nil
 }
 
-// buildHTTPFilterForInferencePool returns the HTTP filter for the given InferencePool.
-func buildHTTPFilterForInferencePool(pool *gwaiev1.InferencePool) *extprocv3.ExternalProcessor {
-	// Read processing body mode from annotations, default to "duplex" (FULL_DUPLEX_STREAMED)
-	processingBodyMode := getProcessingBodyModeFromAnnotations(pool)
+// buildInferencePoolResponseHTTPFilter returns the send-and-go response observer.
+// Envoy writes the upstream body to the client without waiting for EPP, and sends
+// the same bytes to EPP so usage and in-flight accounting still run.
+func buildInferencePoolResponseHTTPFilter(pool *gwaiev1.InferencePool) (*httpconnectionmanagerv3.HttpFilter, error) {
+	a, err := toAny(buildResponseObserverHTTPFilter(pool))
+	if err != nil {
+		return nil, fmt.Errorf("failed to build response observer for InferencePool %s/%s: %w", pool.GetNamespace(), pool.GetName(), err)
+	}
+	return &httpconnectionmanagerv3.HttpFilter{
+		Name:       httpFilterNameForInferencePoolResponse(pool),
+		ConfigType: &httpconnectionmanagerv3.HttpFilter_TypedConfig{TypedConfig: a},
+	}, nil
+}
 
-	// Read allow mode override from annotations, default to false
+func grpcServiceForInferencePool(pool *gwaiev1.InferencePool) *corev3.GrpcService {
+	return &corev3.GrpcService{
+		TargetSpecifier: &corev3.GrpcService_EnvoyGrpc_{
+			EnvoyGrpc: &corev3.GrpcService_EnvoyGrpc{
+				ClusterName: clusterNameForInferencePool(pool),
+				Authority:   authorityForInferencePool(pool),
+			},
+		},
+	}
+}
+
+// buildHTTPFilterForInferencePool returns the synchronous request ext_proc filter.
+// The response is not sent on this stream: waiting for EPP to echo each SSE chunk
+// stalls vLLM. Response bytes go through buildResponseObserverHTTPFilter.
+func buildHTTPFilterForInferencePool(pool *gwaiev1.InferencePool) *extprocv3.ExternalProcessor {
+	processingBodyMode := getProcessingBodyModeFromAnnotations(pool)
 	allowModeOverride := getAllowModeOverrideFromAnnotations(pool)
 
 	return &extprocv3.ExternalProcessor{
-		GrpcService: &corev3.GrpcService{
-			TargetSpecifier: &corev3.GrpcService_EnvoyGrpc_{
-				EnvoyGrpc: &corev3.GrpcService_EnvoyGrpc{
-					ClusterName: clusterNameForInferencePool(pool),
-					Authority:   authorityForInferencePool(pool),
-				},
-			},
-		},
+		GrpcService: grpcServiceForInferencePool(pool),
 		ProcessingMode: &extprocv3.ProcessingMode{
 			RequestHeaderMode:   extprocv3.ProcessingMode_SEND,
 			RequestBodyMode:     processingBodyMode,
 			RequestTrailerMode:  extprocv3.ProcessingMode_SEND,
-			ResponseBodyMode:    processingBodyMode,
-			ResponseHeaderMode:  extprocv3.ProcessingMode_SEND,
-			ResponseTrailerMode: extprocv3.ProcessingMode_SEND,
+			ResponseHeaderMode:  extprocv3.ProcessingMode_SKIP,
+			ResponseBodyMode:    extprocv3.ProcessingMode_NONE,
+			ResponseTrailerMode: extprocv3.ProcessingMode_SKIP,
 		},
 		AllowModeOverride: allowModeOverride,
 		MessageTimeout:    durationpb.New(300 * time.Second),
 		FailureModeAllow:  false,
+	}
+}
+
+// buildResponseObserverHTTPFilter returns an observability-mode filter.
+// Only STREAMED body mode is honored in that mode; replies are ignored, so the
+// client receives upstream bytes before EPP finishes parsing them.
+func buildResponseObserverHTTPFilter(pool *gwaiev1.InferencePool) *extprocv3.ExternalProcessor {
+	return &extprocv3.ExternalProcessor{
+		GrpcService: grpcServiceForInferencePool(pool),
+		ProcessingMode: &extprocv3.ProcessingMode{
+			RequestHeaderMode:   extprocv3.ProcessingMode_SKIP,
+			RequestBodyMode:     extprocv3.ProcessingMode_NONE,
+			RequestTrailerMode:  extprocv3.ProcessingMode_SKIP,
+			ResponseHeaderMode:  extprocv3.ProcessingMode_SEND,
+			ResponseBodyMode:    extprocv3.ProcessingMode_STREAMED,
+			ResponseTrailerMode: extprocv3.ProcessingMode_SEND,
+		},
+		// request.id lets the response stream adopt the in-flight lease created
+		// by the synchronous request filter. Envoy stores it under the ext_proc
+		// attribute namespace.
+		ResponseAttributes: []string{"request.id"},
+		ObservabilityMode:  true,
+		AllowModeOverride:  false,
+		MessageTimeout:     durationpb.New(300 * time.Second),
+		// A failing observer must not fail or pause the client response.
+		FailureModeAllow: true,
 	}
 }
 
@@ -450,9 +493,39 @@ func clusterNameForInferencePool(pool *gwaiev1.InferencePool) string {
 	return fmt.Sprintf("envoy.clusters.endpointpicker_%s_%s_ext_proc", pool.GetName(), pool.GetNamespace())
 }
 
-// httpFilterNameForInferencePool returns the name of the ext_proc cluster for the given InferencePool.
+// httpFilterNameForInferencePool returns the name of the request ext_proc filter.
 func httpFilterNameForInferencePool(pool *gwaiev1.InferencePool) string {
 	return fmt.Sprintf("envoy.filters.http.ext_proc/endpointpicker/%s_%s_ext_proc", pool.GetName(), pool.GetNamespace())
+}
+
+// httpFilterNameForInferencePoolResponse returns the observability response filter name.
+func httpFilterNameForInferencePoolResponse(pool *gwaiev1.InferencePool) string {
+	return httpFilterNameForInferencePool(pool) + "_response"
+}
+
+func inferencePoolFilterNames(pool *gwaiev1.InferencePool) []string {
+	return []string{
+		httpFilterNameForInferencePool(pool),
+		httpFilterNameForInferencePoolResponse(pool),
+	}
+}
+
+func inferencePoolOwnsFilter(pool *gwaiev1.InferencePool, filterName string) bool {
+	for _, name := range inferencePoolFilterNames(pool) {
+		if name == filterName {
+			return true
+		}
+	}
+	return false
+}
+
+func httpFilterPresent(chain []*httpconnectionmanagerv3.HttpFilter, name string) bool {
+	for _, filter := range chain {
+		if filter.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // Tries to find an HTTP connection manager in the provided filter chain.

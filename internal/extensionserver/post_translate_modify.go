@@ -789,20 +789,23 @@ func (s *Server) patchListenerWithInferencePoolFilters(listener *listenerv3.List
 		}
 		var poolFilters []*httpconnectionmanagerv3.HttpFilter
 		for _, pool := range inferencePools {
-			_, baIndex, searchErr := searchInferencePoolInFilterChain(pool, httpConManager.HttpFilters)
-			if searchErr != nil {
-				s.log.Error(searchErr, "failed to find an inference pool ext proc filter")
-				continue
-			}
-			if baIndex == -1 {
-				s.log.Info("adding inference pool ext proc filter", "pool", pool.Name)
-				var eppExtProc *httpconnectionmanagerv3.HttpFilter
-				eppExtProc, err = buildInferencePoolHTTPFilter(pool)
-				if err != nil {
-					s.log.Error(err, "failed to build inference pool ext proc filter", "pool", pool.Name)
+			if !httpFilterPresent(httpConManager.HttpFilters, httpFilterNameForInferencePool(pool)) {
+				s.log.Info("adding inference pool request ext proc filter", "pool", pool.Name)
+				eppExtProc, buildErr := buildInferencePoolHTTPFilter(pool)
+				if buildErr != nil {
+					s.log.Error(buildErr, "failed to build inference pool request ext proc filter", "pool", pool.Name)
 					continue
 				}
 				poolFilters = append(poolFilters, eppExtProc)
+			}
+			if !httpFilterPresent(httpConManager.HttpFilters, httpFilterNameForInferencePoolResponse(pool)) {
+				s.log.Info("adding inference pool response observer ext proc filter", "pool", pool.Name)
+				observer, buildErr := buildInferencePoolResponseHTTPFilter(pool)
+				if buildErr != nil {
+					s.log.Error(buildErr, "failed to build inference pool response observer", "pool", pool.Name)
+					continue
+				}
+				poolFilters = append(poolFilters, observer)
 			}
 		}
 		if len(poolFilters) != 0 {
@@ -827,7 +830,9 @@ func (s *Server) patchListenerWithInferencePoolFilters(listener *listenerv3.List
 func (s *Server) patchVirtualHostWithInferencePool(vh *routev3.VirtualHost, inferencePools []*gwaiev1.InferencePool) error {
 	inferenceMatrix := make(map[string]*gwaiev1.InferencePool)
 	for _, pool := range inferencePools {
-		inferenceMatrix[httpFilterNameForInferencePool(pool)] = pool
+		for _, name := range inferencePoolFilterNames(pool) {
+			inferenceMatrix[name] = pool
+		}
 	}
 	for _, route := range vh.Routes {
 		override := &extprocv3.ExtProcPerRoute{
@@ -840,24 +845,15 @@ func (s *Server) patchVirtualHostWithInferencePool(vh *routev3.VirtualHost, infe
 			return fmt.Errorf("failed to marshal ExtProcPerRoute to Any: %w", err)
 		}
 		inferencePool := getInferencePoolByMetadata(route.Metadata)
-		if inferencePool == nil {
-			for key, pool := range inferenceMatrix {
-				s.log.Info("disabling inference pool filter", "route", route.Name, "filter", key, "pool", pool.Name)
-				if route.TypedPerFilterConfig == nil {
-					route.TypedPerFilterConfig = make(map[string]*anypb.Any)
-				}
-				route.TypedPerFilterConfig[key] = overrideAny
+		for key, pool := range inferenceMatrix {
+			if inferencePool != nil && inferencePoolOwnsFilter(inferencePool, key) {
+				continue
 			}
-		} else {
-			for key, pool := range inferenceMatrix {
-				if key != httpFilterNameForInferencePool(inferencePool) {
-					s.log.Info("disabling inference pool filter", "route", route.Name, "filter", key, "pool", pool.Name)
-					if route.TypedPerFilterConfig == nil {
-						route.TypedPerFilterConfig = make(map[string]*anypb.Any)
-					}
-					route.TypedPerFilterConfig[key] = overrideAny
-				}
+			s.log.Info("disabling inference pool filter", "route", route.Name, "filter", key, "pool", pool.Name)
+			if route.TypedPerFilterConfig == nil {
+				route.TypedPerFilterConfig = make(map[string]*anypb.Any)
 			}
+			route.TypedPerFilterConfig[key] = overrideAny
 		}
 	}
 	return nil

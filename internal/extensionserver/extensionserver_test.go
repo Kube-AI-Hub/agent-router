@@ -1301,11 +1301,13 @@ func TestPatchListenerWithInferencePoolFilters(t *testing.T) {
 
 		s.patchListenerWithInferencePoolFilters(listener, pools)
 
-		// Verify no additional filters were added since the filter already exists.
+		// The request filter is already present. The response observer is still added.
 		hcm := &httpconnectionmanagerv3.HttpConnectionManager{}
 		err := listener.DefaultFilterChain.Filters[0].GetTypedConfig().UnmarshalTo(hcm)
 		require.NoError(t, err)
-		require.Len(t, hcm.HttpFilters, 2) // Should still have the same number of filters.
+		require.Len(t, hcm.HttpFilters, 3)
+		require.Equal(t, httpFilterNameForInferencePoolResponse(pools[0]), hcm.HttpFilters[1].Name)
+		require.Equal(t, "envoy.filters.http.router", hcm.HttpFilters[2].Name)
 	})
 
 	t.Run("listener with new inference pool filter", func(t *testing.T) {
@@ -1322,9 +1324,10 @@ func TestPatchListenerWithInferencePoolFilters(t *testing.T) {
 		hcm := &httpconnectionmanagerv3.HttpConnectionManager{}
 		err := listener.DefaultFilterChain.Filters[0].GetTypedConfig().UnmarshalTo(hcm)
 		require.NoError(t, err)
-		require.Len(t, hcm.HttpFilters, 2) // Should have inference pool filter + router.
+		require.Len(t, hcm.HttpFilters, 3) // request filter, response observer, router
 		require.Equal(t, httpFilterNameForInferencePool(pools[0]), hcm.HttpFilters[0].Name)
-		require.Equal(t, "envoy.filters.http.router", hcm.HttpFilters[1].Name)
+		require.Equal(t, httpFilterNameForInferencePoolResponse(pools[0]), hcm.HttpFilters[1].Name)
+		require.Equal(t, "envoy.filters.http.router", hcm.HttpFilters[2].Name)
 	})
 
 	t.Run("listener with multiple inference pools", func(t *testing.T) {
@@ -1344,10 +1347,12 @@ func TestPatchListenerWithInferencePoolFilters(t *testing.T) {
 		hcm := &httpconnectionmanagerv3.HttpConnectionManager{}
 		err := listener.DefaultFilterChain.Filters[0].GetTypedConfig().UnmarshalTo(hcm)
 		require.NoError(t, err)
-		require.Len(t, hcm.HttpFilters, 3) // Should have 2 inference pool filters + router.
+		require.Len(t, hcm.HttpFilters, 5) // two pools, request + response observer each, plus router
 		require.Equal(t, httpFilterNameForInferencePool(pools[0]), hcm.HttpFilters[0].Name)
-		require.Equal(t, httpFilterNameForInferencePool(pools[1]), hcm.HttpFilters[1].Name)
-		require.Equal(t, "envoy.filters.http.router", hcm.HttpFilters[2].Name)
+		require.Equal(t, httpFilterNameForInferencePoolResponse(pools[0]), hcm.HttpFilters[1].Name)
+		require.Equal(t, httpFilterNameForInferencePool(pools[1]), hcm.HttpFilters[2].Name)
+		require.Equal(t, httpFilterNameForInferencePoolResponse(pools[1]), hcm.HttpFilters[3].Name)
+		require.Equal(t, "envoy.filters.http.router", hcm.HttpFilters[4].Name)
 	})
 
 	t.Run("listener with both filter chains and default filter chain", func(t *testing.T) {
@@ -1388,13 +1393,13 @@ func TestPatchListenerWithInferencePoolFilters(t *testing.T) {
 		hcm1 := &httpconnectionmanagerv3.HttpConnectionManager{}
 		err := listener.FilterChains[0].Filters[0].GetTypedConfig().UnmarshalTo(hcm1)
 		require.NoError(t, err)
-		require.Len(t, hcm1.HttpFilters, 2)
+		require.Len(t, hcm1.HttpFilters, 3)
 
 		// Check the default filter chain.
 		hcm2 := &httpconnectionmanagerv3.HttpConnectionManager{}
 		err = listener.DefaultFilterChain.Filters[0].GetTypedConfig().UnmarshalTo(hcm2)
 		require.NoError(t, err)
-		require.Len(t, hcm2.HttpFilters, 2)
+		require.Len(t, hcm2.HttpFilters, 3)
 	})
 
 	t.Run("error marshaling updated HCM", func(_ *testing.T) {
@@ -1486,6 +1491,7 @@ func TestPatchVirtualHostWithInferencePool(t *testing.T) {
 		require.NotNil(t, normalRoute.TypedPerFilterConfig)
 		filterName := httpFilterNameForInferencePool(pools[0])
 		require.Contains(t, normalRoute.TypedPerFilterConfig, filterName)
+		require.Contains(t, normalRoute.TypedPerFilterConfig, httpFilterNameForInferencePoolResponse(pools[0]))
 	})
 
 	t.Run("route with matching InferencePool metadata", func(t *testing.T) {
@@ -1532,7 +1538,9 @@ func TestPatchVirtualHostWithInferencePool(t *testing.T) {
 		pool2FilterName := httpFilterNameForInferencePool(pool2)
 
 		require.NotContains(t, inferenceRoute.TypedPerFilterConfig, pool1FilterName)
+		require.NotContains(t, inferenceRoute.TypedPerFilterConfig, httpFilterNameForInferencePoolResponse(pool1))
 		require.Contains(t, inferenceRoute.TypedPerFilterConfig, pool2FilterName)
+		require.Contains(t, inferenceRoute.TypedPerFilterConfig, httpFilterNameForInferencePoolResponse(pool2))
 	})
 
 	t.Run("route with direct response containing 'No matching route found'", func(t *testing.T) {
@@ -1608,19 +1616,21 @@ func TestPatchVirtualHostWithInferencePool(t *testing.T) {
 		err := s.patchVirtualHostWithInferencePool(vh, pools)
 		require.NoError(t, err)
 
-		// Verify normal route disables both filters.
+		// Verify normal route disables request and response filters for both pools.
 		require.NotNil(t, normalRoute.TypedPerFilterConfig)
-		require.Len(t, normalRoute.TypedPerFilterConfig, 2)
+		require.Len(t, normalRoute.TypedPerFilterConfig, 4)
 
-		// Verify inference route 1 disables only pool2's filter.
+		// Verify inference route 1 disables only pool2's filters.
 		require.NotNil(t, inferenceRoute1.TypedPerFilterConfig)
-		require.Len(t, inferenceRoute1.TypedPerFilterConfig, 1)
+		require.Len(t, inferenceRoute1.TypedPerFilterConfig, 2)
 		require.Contains(t, inferenceRoute1.TypedPerFilterConfig, httpFilterNameForInferencePool(pool2))
+		require.Contains(t, inferenceRoute1.TypedPerFilterConfig, httpFilterNameForInferencePoolResponse(pool2))
 
-		// Verify inference route 2 disables only pool1's filter.
+		// Verify inference route 2 disables only pool1's filters.
 		require.NotNil(t, inferenceRoute2.TypedPerFilterConfig)
-		require.Len(t, inferenceRoute2.TypedPerFilterConfig, 1)
+		require.Len(t, inferenceRoute2.TypedPerFilterConfig, 2)
 		require.Contains(t, inferenceRoute2.TypedPerFilterConfig, httpFilterNameForInferencePool(pool1))
+		require.Contains(t, inferenceRoute2.TypedPerFilterConfig, httpFilterNameForInferencePoolResponse(pool1))
 	})
 }
 
@@ -2386,10 +2396,12 @@ func TestBuildHTTPFilterForInferencePool(t *testing.T) {
 		filter := buildHTTPFilterForInferencePool(pool)
 		require.NotNil(t, filter)
 		require.Equal(t, extprocv3.ProcessingMode_FULL_DUPLEX_STREAMED, filter.ProcessingMode.RequestBodyMode)
-		require.Equal(t, extprocv3.ProcessingMode_FULL_DUPLEX_STREAMED, filter.ProcessingMode.ResponseBodyMode)
+		require.Equal(t, extprocv3.ProcessingMode_NONE, filter.ProcessingMode.ResponseBodyMode)
+		require.Equal(t, extprocv3.ProcessingMode_SKIP, filter.ProcessingMode.ResponseHeaderMode)
 		require.Equal(t, extprocv3.ProcessingMode_SEND, filter.ProcessingMode.RequestTrailerMode)
-		require.Equal(t, extprocv3.ProcessingMode_SEND, filter.ProcessingMode.ResponseTrailerMode)
+		require.Equal(t, extprocv3.ProcessingMode_SKIP, filter.ProcessingMode.ResponseTrailerMode)
 		require.False(t, filter.AllowModeOverride)
+		require.False(t, filter.ObservabilityMode)
 	})
 
 	t.Run("with buffered mode annotation", func(t *testing.T) {
@@ -2409,9 +2421,10 @@ func TestBuildHTTPFilterForInferencePool(t *testing.T) {
 		filter := buildHTTPFilterForInferencePool(pool)
 		require.NotNil(t, filter)
 		require.Equal(t, extprocv3.ProcessingMode_BUFFERED, filter.ProcessingMode.RequestBodyMode)
-		require.Equal(t, extprocv3.ProcessingMode_BUFFERED, filter.ProcessingMode.ResponseBodyMode)
+		require.Equal(t, extprocv3.ProcessingMode_NONE, filter.ProcessingMode.ResponseBodyMode)
+		require.Equal(t, extprocv3.ProcessingMode_SKIP, filter.ProcessingMode.ResponseHeaderMode)
 		require.Equal(t, extprocv3.ProcessingMode_SEND, filter.ProcessingMode.RequestTrailerMode)
-		require.Equal(t, extprocv3.ProcessingMode_SEND, filter.ProcessingMode.ResponseTrailerMode)
+		require.Equal(t, extprocv3.ProcessingMode_SKIP, filter.ProcessingMode.ResponseTrailerMode)
 		require.False(t, filter.AllowModeOverride)
 	})
 
@@ -2432,9 +2445,10 @@ func TestBuildHTTPFilterForInferencePool(t *testing.T) {
 		filter := buildHTTPFilterForInferencePool(pool)
 		require.NotNil(t, filter)
 		require.Equal(t, extprocv3.ProcessingMode_FULL_DUPLEX_STREAMED, filter.ProcessingMode.RequestBodyMode)
-		require.Equal(t, extprocv3.ProcessingMode_FULL_DUPLEX_STREAMED, filter.ProcessingMode.ResponseBodyMode)
+		require.Equal(t, extprocv3.ProcessingMode_NONE, filter.ProcessingMode.ResponseBodyMode)
+		require.Equal(t, extprocv3.ProcessingMode_SKIP, filter.ProcessingMode.ResponseHeaderMode)
 		require.Equal(t, extprocv3.ProcessingMode_SEND, filter.ProcessingMode.RequestTrailerMode)
-		require.Equal(t, extprocv3.ProcessingMode_SEND, filter.ProcessingMode.ResponseTrailerMode)
+		require.Equal(t, extprocv3.ProcessingMode_SKIP, filter.ProcessingMode.ResponseTrailerMode)
 		require.True(t, filter.AllowModeOverride)
 	})
 
@@ -2456,10 +2470,33 @@ func TestBuildHTTPFilterForInferencePool(t *testing.T) {
 		filter := buildHTTPFilterForInferencePool(pool)
 		require.NotNil(t, filter)
 		require.Equal(t, extprocv3.ProcessingMode_BUFFERED, filter.ProcessingMode.RequestBodyMode)
-		require.Equal(t, extprocv3.ProcessingMode_BUFFERED, filter.ProcessingMode.ResponseBodyMode)
+		require.Equal(t, extprocv3.ProcessingMode_NONE, filter.ProcessingMode.ResponseBodyMode)
+		require.Equal(t, extprocv3.ProcessingMode_SKIP, filter.ProcessingMode.ResponseHeaderMode)
 		require.Equal(t, extprocv3.ProcessingMode_SEND, filter.ProcessingMode.RequestTrailerMode)
-		require.Equal(t, extprocv3.ProcessingMode_SEND, filter.ProcessingMode.ResponseTrailerMode)
+		require.Equal(t, extprocv3.ProcessingMode_SKIP, filter.ProcessingMode.ResponseTrailerMode)
 		require.True(t, filter.AllowModeOverride)
+	})
+
+	t.Run("response observer is send-and-go", func(t *testing.T) {
+		pool := &gwaiev1.InferencePool{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-pool",
+				Namespace: "test-ns",
+			},
+			Spec: gwaiev1.InferencePoolSpec{
+				EndpointPickerRef: &gwaiev1.EndpointPickerRef{Name: "test-epp"},
+			},
+		}
+
+		filter := buildResponseObserverHTTPFilter(pool)
+		require.True(t, filter.ObservabilityMode)
+		require.Equal(t, extprocv3.ProcessingMode_SKIP, filter.ProcessingMode.RequestHeaderMode)
+		require.Equal(t, extprocv3.ProcessingMode_NONE, filter.ProcessingMode.RequestBodyMode)
+		require.Equal(t, extprocv3.ProcessingMode_SEND, filter.ProcessingMode.ResponseHeaderMode)
+		require.Equal(t, extprocv3.ProcessingMode_STREAMED, filter.ProcessingMode.ResponseBodyMode)
+		require.Equal(t, []string{"request.id"}, filter.ResponseAttributes)
+		require.True(t, filter.FailureModeAllow)
+		require.False(t, filter.AllowModeOverride)
 	})
 }
 
